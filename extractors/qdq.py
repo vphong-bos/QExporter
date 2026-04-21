@@ -1,0 +1,483 @@
+"""QDQ ONNX extractor producing AIMET-compatible encodings or torch state."""
+
+from collections import defaultdict
+
+import onnx
+import torch
+from onnx import numpy_helper
+
+from .base import BaseExtractor
+
+
+class QuantizedOnnxExtractor(BaseExtractor):
+    WEIGHT_Q_SUFFIX = ".weight_q"
+    BIAS_Q_SUFFIX = ".bias_q"
+    RUNTIME_INITIALIZERS = {"input_scale", "input_zero_point"}
+
+    PASSTHROUGH_OPS = {
+        "Transpose", "Reshape", "Identity", "Cast",
+        "Flatten", "Squeeze", "Unsqueeze",
+    }
+
+    COMPUTE_OPS = {"Conv", "MatMul", "Gemm"}
+
+    def __init__(self, ckpt_path, compute_ops=None, passthrough_ops=None):
+        super().__init__(ckpt_path)
+        self.ckpt_path = str(ckpt_path)
+        self.onnx_model = onnx.load(self.ckpt_path)
+        self.initializers = self._build_initializer_map()
+        self.producer, self.consumers = self._build_graph_maps()
+        self.compute_ops = set(compute_ops) if compute_ops is not None else set(self.COMPUTE_OPS)
+        self.passthrough_ops = set(passthrough_ops) if passthrough_ops is not None else set(self.PASSTHROUGH_OPS)
+
+    @staticmethod
+    def _to_torch_tensor(initializer):
+        return torch.from_numpy(numpy_helper.to_array(initializer).copy())
+
+    @staticmethod
+    def _dequantize_tensor(q_tensor, scale_tensor, zero_point_tensor):
+        q_tensor = q_tensor.to(torch.float32)
+        scale_tensor = scale_tensor.to(torch.float32)
+        zero_point_tensor = zero_point_tensor.to(torch.float32)
+
+        if scale_tensor.ndim == 1 and q_tensor.ndim > 1 and scale_tensor.shape[0] == q_tensor.shape[0]:
+            view_shape = [q_tensor.shape[0]] + [1] * (q_tensor.ndim - 1)
+            scale_tensor = scale_tensor.reshape(view_shape)
+            zero_point_tensor = zero_point_tensor.reshape(view_shape)
+
+        return (q_tensor - zero_point_tensor) * scale_tensor
+
+    def _build_initializer_map(self):
+        return {initializer.name: initializer for initializer in self.onnx_model.graph.initializer}
+
+    def _build_graph_maps(self):
+        producer = {}
+        consumers = defaultdict(list)
+        for node in self.onnx_model.graph.node:
+            for out in node.output:
+                producer[out] = node
+            for inp in node.input:
+                consumers[inp].append(node)
+        return producer, consumers
+
+    def _find_quantized_prefixes(self):
+        return sorted(
+            initializer.name[: -len(self.WEIGHT_Q_SUFFIX)]
+            for initializer in self.onnx_model.graph.initializer
+            if initializer.name.endswith(self.WEIGHT_Q_SUFFIX)
+        )
+
+    @staticmethod
+    def _normalize_prefix(name):
+        for wrapper in ("model.", "module.", "_orig_mod."):
+            while name.startswith(wrapper):
+                name = name[len(wrapper):]
+        return name
+
+    def _onnx_prefix_to_state_prefix(self, prefix):
+        return self._normalize_prefix(prefix)
+
+    def _onnx_name_to_state_key(self, name):
+        if name.endswith(".weight") or name.endswith(".bias"):
+            prefix, suffix = name.rsplit(".", 1)
+            return f"{self._onnx_prefix_to_state_prefix(prefix)}.{suffix}"
+        return self._onnx_prefix_to_state_prefix(name)
+
+    def _matmul_node_name_to_state_key(self, node_name):
+        if not node_name.endswith("/MatMul"):
+            return None
+        prefix = node_name[: -len("/MatMul")].strip("/").replace("/", ".")
+        if not prefix:
+            return None
+        return f"{self._onnx_prefix_to_state_prefix(prefix)}.weight"
+
+    def _is_runtime_initializer(self, name):
+        return name.startswith("/") or name in self.RUNTIME_INITIALIZERS
+
+    def _is_plain_model_initializer(self, name):
+        if self._is_runtime_initializer(name):
+            return False
+        return name.endswith(".weight") or name.endswith(".bias")
+
+    def _find_compute_node_from_weight_qdq(self, weight_tensor_name):
+        queue = [weight_tensor_name]
+        seen = set()
+        while queue:
+            tensor = queue.pop(0)
+            if tensor in seen:
+                continue
+            seen.add(tensor)
+            for consumer in self.consumers.get(tensor, []):
+                if consumer.op_type in self.compute_ops:
+                    return consumer
+                if consumer.op_type in self.passthrough_ops:
+                    queue.extend(consumer.output)
+        return None
+
+    @staticmethod
+    def _find_activation_input_name(compute_node, weight_prefix):
+        weight_roots = {
+            f"{weight_prefix}.weight_qdq",
+            f"{weight_prefix}.weight_q",
+            f"{weight_prefix}.weight",
+        }
+        for inp in compute_node.input:
+            if any(inp.startswith(root) for root in weight_roots):
+                continue
+            return inp
+        if compute_node.op_type == "Conv":
+            return compute_node.input[0]
+        if len(compute_node.input) >= 2:
+            return compute_node.input[0]
+        return None
+
+    def _extract_qparams_from_dq_tensor(self, tensor_name):
+        upstream_ops = {
+            "Transpose", "Reshape", "Identity", "Cast", "Flatten",
+            "Squeeze", "Unsqueeze", "GlobalAveragePool", "AveragePool",
+            "MaxPool", "Relu", "Clip", "Concat",
+            "ReduceMean", "ReduceSum", "Shape", "Gather",
+            "Add", "Mul", "Sub", "Div", "Tile", "Expand",
+            "Pad", "Slice", "Where", "Constant", "ConstantOfShape",
+            "GridSampleBilinearZerosAC0", "ScatterND", "Softmax",
+        }
+        visited = set()
+        queue = [tensor_name]
+        while queue:
+            name = queue.pop(0)
+            if name in visited:
+                continue
+            visited.add(name)
+            node = self.producer.get(name)
+            if node is None:
+                continue
+            if node.op_type == "DequantizeLinear" and len(node.input) >= 3:
+                scale_name, zero_point_name = node.input[1], node.input[2]
+                if scale_name in self.initializers and zero_point_name in self.initializers:
+                    return {
+                        "scale": self._to_torch_tensor(self.initializers[scale_name]),
+                        "zeropoint": self._to_torch_tensor(self.initializers[zero_point_name]),
+                    }
+            if node.op_type in upstream_ops:
+                queue.extend(node.input)
+        return None
+
+    def _find_output_quant_params(self, prefix, compute_node):
+        downstream_ops = {
+            "BatchNormalization", "Relu", "Clip", "Add", "Transpose",
+            "Reshape", "Identity", "Cast", "Flatten", "Squeeze",
+            "Unsqueeze", "GlobalAveragePool", "AveragePool", "MaxPool",
+        }
+        output_tensor = compute_node.output[0]
+        if compute_node.op_type in {"MatMul", "Gemm"}:
+            for consumer in self.consumers.get(output_tensor, []):
+                if consumer.op_type == "Add" and any(inp == f"{prefix}.bias_qdq" for inp in consumer.input):
+                    output_tensor = consumer.output[0]
+                    break
+
+        visited = set()
+        queue = [output_tensor]
+        while queue:
+            tensor = queue.pop(0)
+            if tensor in visited:
+                continue
+            visited.add(tensor)
+            for consumer in self.consumers.get(tensor, []):
+                if consumer.op_type == "QuantizeLinear" and len(consumer.input) >= 3:
+                    scale_name, zero_point_name = consumer.input[1], consumer.input[2]
+                    if scale_name in self.initializers and zero_point_name in self.initializers:
+                        return {
+                            "scale": self._to_torch_tensor(self.initializers[scale_name]),
+                            "zeropoint": self._to_torch_tensor(self.initializers[zero_point_name]),
+                        }
+                if consumer.op_type in downstream_ops:
+                    queue.extend(consumer.output)
+        return None
+
+    def _find_output_quant_params_via_weight_path(self, prefix):
+        weight_tensor_name = f"{prefix}.weight_qdq"
+        visited = set()
+        queue = [weight_tensor_name]
+        while queue:
+            tensor = queue.pop(0)
+            if tensor in visited:
+                continue
+            visited.add(tensor)
+            for consumer in self.consumers.get(tensor, []):
+                if consumer.op_type == "QuantizeLinear" and len(consumer.input) >= 3:
+                    scale_name, zero_point_name = consumer.input[1], consumer.input[2]
+                    if scale_name in self.initializers and zero_point_name in self.initializers:
+                        return {
+                            "scale": self._to_torch_tensor(self.initializers[scale_name]),
+                            "zeropoint": self._to_torch_tensor(self.initializers[zero_point_name]),
+                        }
+                if consumer.op_type in self.passthrough_ops:
+                    queue.extend(consumer.output)
+        return None
+
+    def _add_quantized_param_triplet(self, state_dict, state_prefix, param_name, onnx_prefix):
+        q_name = f"{onnx_prefix}.{param_name}_q"
+        scale_name = f"{onnx_prefix}.{param_name}_scale"
+        zero_point_name = f"{onnx_prefix}.{param_name}_zero_point"
+
+        if q_name not in self.initializers:
+            return False
+
+        q_tensor = self._to_torch_tensor(self.initializers[q_name])
+        scale_tensor = self._to_torch_tensor(self.initializers[scale_name])
+        zero_point_tensor = self._to_torch_tensor(self.initializers[zero_point_name])
+
+        state_dict[f"{state_prefix}.{param_name}"] = self._dequantize_tensor(q_tensor, scale_tensor, zero_point_tensor)
+        state_dict[f"{state_prefix}.{param_name}_q"] = q_tensor
+        state_dict[f"{state_prefix}.{param_name}_scale"] = scale_tensor
+        state_dict[f"{state_prefix}.{param_name}_zero_point"] = zero_point_tensor
+        return True
+
+    def _add_anonymous_matmul_weight(self, state_dict, initializer_name, initializer):
+        if not initializer_name.startswith("onnx::MatMul_"):
+            return False
+
+        matmul_consumers = [consumer for consumer in self.consumers.get(initializer_name, []) if consumer.op_type == "MatMul"]
+        if len(matmul_consumers) != 1:
+            return False
+
+        state_key = self._matmul_node_name_to_state_key(matmul_consumers[0].name)
+        if state_key is None:
+            return False
+
+        weight = self._to_torch_tensor(initializer).to(torch.float32)
+        if weight.ndim == 2:
+            weight = weight.transpose(0, 1)
+        state_dict[state_key] = weight
+        return True
+
+    @staticmethod
+    def _onnx_node_name_to_module(node_name):
+        name = node_name.lstrip("/")
+        parts = name.split("/")
+        if len(parts) > 1:
+            parts = parts[:-1]
+        filtered = []
+        for index, part in enumerate(parts):
+            if index + 1 < len(parts) and parts[index + 1].startswith(part + "."):
+                continue
+            filtered.append(part)
+        return ".".join(filtered)
+
+    @staticmethod
+    def _to_python(value):
+        if isinstance(value, torch.Tensor):
+            return value.item() if value.numel() == 1 else value.detach().cpu().tolist()
+        return value
+
+    @staticmethod
+    def _qparams_to_aimet_encoding(scale_tensor, zeropoint_tensor):
+        scale = QuantizedOnnxExtractor._to_python(scale_tensor)
+        zeropoint = QuantizedOnnxExtractor._to_python(zeropoint_tensor)
+
+        def one_encoding(scale_value, zero_point_value):
+            zero_point_value, scale_value = int(zero_point_value), float(scale_value)
+            if zero_point_value == 0 or zero_point_value == 128:
+                zero_point_value = 128
+                dtype, qmin, qmax, is_symmetric = "int", 0, 255, "True"
+            else:
+                dtype, qmin, qmax, is_symmetric = "int", -128, 128, "False"
+            return {
+                "bitwidth": 8,
+                "dtype": dtype,
+                "is_symmetric": is_symmetric,
+                "max": float((qmax - zero_point_value) * scale_value),
+                "min": float((qmin - zero_point_value) * scale_value),
+                "offset": -zero_point_value,
+                "scale": scale_value,
+            }
+
+        if isinstance(scale, list):
+            if not isinstance(zeropoint, list):
+                zeropoint = [zeropoint] * len(scale)
+            return [one_encoding(scale_value, zero_point_value) for scale_value, zero_point_value in zip(scale, zeropoint)]
+        return one_encoding(scale, zeropoint)
+
+    def _get_activation_roles(self, export_prefix):
+        return {"input", "output"}
+
+    def _get_torch_activation_roles(self, export_prefix):
+        """Return activation qparam roles for .pt export.
+
+        By default this mirrors the encodings export behavior, but model-specific
+        extractors can override it when the target .pt naming/layout differs.
+        """
+        return self._get_activation_roles(export_prefix)
+
+    def _postprocess_torch_state(self, state_dict):
+        """Allow model-specific .pt export cleanup or augmentation."""
+        return state_dict
+
+    def _collect_activation_only_encodings(self):
+        encodings = {}
+        act_ops = {"Relu", "MaxPool", "AveragePool", "GlobalAveragePool"}
+        for node in self.onnx_model.graph.node:
+            if node.op_type not in act_ops:
+                continue
+            module_name = self._onnx_node_name_to_module(node.name)
+            layer_act = {}
+            if node.input:
+                qparams = self._extract_qparams_from_dq_tensor(node.input[0])
+                if qparams:
+                    layer_act["input"] = {"0": self._qparams_to_aimet_encoding(qparams["scale"], qparams["zeropoint"])}
+            if node.output:
+                for consumer in self.consumers.get(node.output[0], []):
+                    if consumer.op_type == "QuantizeLinear" and len(consumer.input) >= 3:
+                        scale_name, zero_point_name = consumer.input[1], consumer.input[2]
+                        if scale_name in self.initializers and zero_point_name in self.initializers:
+                            layer_act["output"] = {
+                                "0": self._qparams_to_aimet_encoding(
+                                    self._to_torch_tensor(self.initializers[scale_name]),
+                                    self._to_torch_tensor(self.initializers[zero_point_name]),
+                                )
+                            }
+                            break
+            if layer_act:
+                encodings[module_name] = layer_act
+        return encodings
+
+    def collect_encodings(self):
+        activation_encodings = {}
+        param_encodings = {}
+        missing_input, missing_output = [], []
+
+        for prefix in self._find_quantized_prefixes():
+            export_prefix = self._normalize_prefix(prefix)
+
+            weight_scale_name = f"{prefix}.weight_scale"
+            weight_zero_point_name = f"{prefix}.weight_zero_point"
+            if weight_scale_name in self.initializers and weight_zero_point_name in self.initializers:
+                param_encodings[f"{export_prefix}.weight"] = self._qparams_to_aimet_encoding(
+                    self._to_torch_tensor(self.initializers[weight_scale_name]),
+                    self._to_torch_tensor(self.initializers[weight_zero_point_name]),
+                )
+
+            roles = self._get_activation_roles(export_prefix)
+            if not roles:
+                continue
+
+            compute_node = self._find_compute_node_from_weight_qdq(f"{prefix}.weight_qdq")
+            if compute_node is None and "input" in roles:
+                missing_input.append(prefix)
+
+            layer_act = {}
+            if "input" in roles and compute_node is not None:
+                activation_input_name = self._find_activation_input_name(compute_node, prefix)
+                qparams = self._extract_qparams_from_dq_tensor(activation_input_name) if activation_input_name else None
+                if qparams:
+                    layer_act["input"] = {"0": self._qparams_to_aimet_encoding(qparams["scale"], qparams["zeropoint"])}
+                else:
+                    missing_input.append(prefix)
+
+            if "output" in roles:
+                qparams = self._find_output_quant_params(prefix, compute_node) if compute_node is not None else None
+                if qparams is None:
+                    qparams = self._find_output_quant_params_via_weight_path(prefix)
+                if qparams:
+                    layer_act["output"] = {"0": self._qparams_to_aimet_encoding(qparams["scale"], qparams["zeropoint"])}
+                else:
+                    missing_output.append(prefix)
+
+            if layer_act:
+                activation_encodings[export_prefix] = layer_act
+
+        activation_encodings.update(self._collect_activation_only_encodings())
+
+        return {
+            "activation_encodings": activation_encodings,
+            "excluded_layers": [],
+            "param_encodings": param_encodings,
+            "quantizer_args": {
+                "activation_bitwidth": 8,
+                "dtype": "int",
+                "is_symmetric": True,
+                "param_bitwidth": 8,
+                "per_channel_quantization": True,
+                "quant_scheme": "post_training_tf_enhanced",
+            },
+            "version": "1.0.0",
+        }, missing_input, missing_output
+
+    def collect_torch_state(self):
+        state_dict = {}
+        missing_input, missing_output = [], []
+        handled_initializer_names = set()
+
+        quantized_prefixes = sorted(
+            {
+                initializer.name[: -len(self.WEIGHT_Q_SUFFIX)]
+                for initializer in self.onnx_model.graph.initializer
+                if initializer.name.endswith(self.WEIGHT_Q_SUFFIX)
+            }
+            | {
+                initializer.name[: -len(self.BIAS_Q_SUFFIX)]
+                for initializer in self.onnx_model.graph.initializer
+                if initializer.name.endswith(self.BIAS_Q_SUFFIX)
+            }
+        )
+
+        for prefix in quantized_prefixes:
+            state_prefix = self._onnx_prefix_to_state_prefix(prefix)
+            roles = self._get_torch_activation_roles(state_prefix)
+
+            if self._add_quantized_param_triplet(state_dict, state_prefix, "weight", prefix):
+                handled_initializer_names.update(
+                    {
+                        f"{prefix}.weight_q",
+                        f"{prefix}.weight_scale",
+                        f"{prefix}.weight_zero_point",
+                    }
+                )
+
+            if self._add_quantized_param_triplet(state_dict, state_prefix, "bias", prefix):
+                handled_initializer_names.update(
+                    {
+                        f"{prefix}.bias_q",
+                        f"{prefix}.bias_scale",
+                        f"{prefix}.bias_zero_point",
+                    }
+                )
+
+            if not roles:
+                continue
+
+            compute_node = self._find_compute_node_from_weight_qdq(f"{prefix}.weight_qdq")
+            if compute_node is None and "input" in roles:
+                missing_input.append(prefix)
+
+            if "input" in roles and compute_node is not None:
+                activation_input_name = self._find_activation_input_name(compute_node, prefix)
+                input_qparams = self._extract_qparams_from_dq_tensor(activation_input_name) if activation_input_name else None
+                if input_qparams is not None:
+                    state_dict[f"{state_prefix}.input_scale"] = input_qparams["scale"]
+                    state_dict[f"{state_prefix}.input_zero_point"] = input_qparams["zeropoint"]
+                else:
+                    missing_input.append(prefix)
+
+            if "output" in roles:
+                output_qparams = self._find_output_quant_params(prefix, compute_node) if compute_node is not None else None
+                if output_qparams is None:
+                    output_qparams = self._find_output_quant_params_via_weight_path(prefix)
+                if output_qparams is not None:
+                    state_dict[f"{state_prefix}.output_scale"] = output_qparams["scale"]
+                    state_dict[f"{state_prefix}.output_zero_point"] = output_qparams["zeropoint"]
+                else:
+                    missing_output.append(prefix)
+
+        for initializer in self.onnx_model.graph.initializer:
+            if initializer.name in handled_initializer_names:
+                continue
+            if self._add_anonymous_matmul_weight(state_dict, initializer.name, initializer):
+                handled_initializer_names.add(initializer.name)
+                continue
+            if not self._is_plain_model_initializer(initializer.name):
+                continue
+            state_dict[self._onnx_name_to_state_key(initializer.name)] = self._to_torch_tensor(initializer).to(torch.float32)
+
+        state_dict = self._postprocess_torch_state(state_dict)
+        return state_dict, missing_input, missing_output

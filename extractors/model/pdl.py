@@ -1,25 +1,18 @@
-"""ResNet Bottleneck extractor (ResNet50 / 101 / 152).
+"""PDL extractor.
 
-AIMET convention for ResNet Bottleneck:
-  - conv1: input encoding only
-  - fc: output encoding only
-  - conv3 / downsample.0: output encoding only
-  - conv1, conv2 in blocks: no activation encoding (weight param only)
+AIMET convention for PDL:
+  - backbone.stem.conv1: output encoding only
   - relu (post-Add): output encoding, named as layerX.Y.relu
   - relu after conv1/conv2 in blocks: skipped
 """
 
-from .base import QuantizedOnnxExtractor
+from ..qdq import QuantizedOnnxExtractor
 
 
-class ResNetExtractor(QuantizedOnnxExtractor):
+class PDLExtractor(QuantizedOnnxExtractor):
 
     def _get_activation_roles(self, export_prefix):
-        if export_prefix == "conv1":
-            return {"input"}
-        if export_prefix == "fc":
-            return {"output"}
-        if export_prefix.endswith(".conv3") or ".downsample." in export_prefix:
+        if export_prefix == "backbone.stem.conv1":
             return {"output"}
         return set()
 

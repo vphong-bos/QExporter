@@ -1,5 +1,7 @@
 fp32_model
 int8_model
+qparams/vit.pt
+qparams/vit_int8_extracted.pt
 
 __pycache__/
 *.pyc

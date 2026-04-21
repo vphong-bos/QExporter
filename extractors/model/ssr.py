@@ -5,7 +5,7 @@
 # Missing output qparams (1):
 #   - model.pts_bbox_head.tokenlearner.layer_norm
 
-from .base import QuantizedOnnxExtractor
+from ..qdq import QuantizedOnnxExtractor
 
 
 class SSRExtractor(QuantizedOnnxExtractor):
