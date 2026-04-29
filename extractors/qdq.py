@@ -20,6 +20,17 @@ class QuantizedOnnxExtractor(BaseExtractor):
     }
 
     COMPUTE_OPS = {"Conv", "MatMul", "Gemm"}
+    ACTIVATION_ONLY_OPS = {
+        "Relu",
+        "LeakyRelu",
+        "Sigmoid",
+        "Softmax",
+        "Add",
+        "Mul",
+        "MaxPool",
+        "AveragePool",
+        "GlobalAveragePool",
+    }
 
     def __init__(self, ckpt_path, compute_ops=None, passthrough_ops=None):
         super().__init__(ckpt_path)
@@ -163,20 +174,22 @@ class QuantizedOnnxExtractor(BaseExtractor):
         return None
 
     def _find_output_quant_params(self, prefix, compute_node):
-        downstream_ops = {
-            "BatchNormalization", "Relu", "Clip", "Add", "Transpose",
-            "Reshape", "Identity", "Cast", "Flatten", "Squeeze",
-            "Unsqueeze", "GlobalAveragePool", "AveragePool", "MaxPool",
-        }
         output_tensor = compute_node.output[0]
         if compute_node.op_type in {"MatMul", "Gemm"}:
             for consumer in self.consumers.get(output_tensor, []):
                 if consumer.op_type == "Add" and any(inp == f"{prefix}.bias_qdq" for inp in consumer.input):
                     output_tensor = consumer.output[0]
                     break
+        downstream_ops = {
+            "BatchNormalization", "Relu", "LeakyRelu", "Clip", "Sigmoid", "Softmax",
+            "Add", "Mul", "Transpose", "Reshape", "Identity", "Cast",
+            "Flatten", "Squeeze", "Unsqueeze", "GlobalAveragePool", "AveragePool", "MaxPool",
+        }
+        return self._find_downstream_quant_params(output_tensor, downstream_ops)
 
+    def _find_downstream_quant_params(self, tensor_name, downstream_ops):
         visited = set()
-        queue = [output_tensor]
+        queue = [tensor_name]
         while queue:
             tensor = queue.pop(0)
             if tensor in visited:
@@ -315,31 +328,75 @@ class QuantizedOnnxExtractor(BaseExtractor):
 
     def _collect_activation_only_encodings(self):
         encodings = {}
-        act_ops = {"Relu", "MaxPool", "AveragePool", "GlobalAveragePool"}
         for node in self.onnx_model.graph.node:
-            if node.op_type not in act_ops:
+            if node.op_type not in self.ACTIVATION_ONLY_OPS:
                 continue
             module_name = self._onnx_node_name_to_module(node.name)
             layer_act = {}
-            if node.input:
-                qparams = self._extract_qparams_from_dq_tensor(node.input[0])
+            for index, input_name in enumerate(node.input):
+                qparams = self._extract_qparams_from_dq_tensor(input_name)
                 if qparams:
-                    layer_act["input"] = {"0": self._qparams_to_aimet_encoding(qparams["scale"], qparams["zeropoint"])}
+                    layer_act.setdefault("input", {})[str(index)] = self._qparams_to_aimet_encoding(
+                        qparams["scale"], qparams["zeropoint"]
+                    )
             if node.output:
-                for consumer in self.consumers.get(node.output[0], []):
-                    if consumer.op_type == "QuantizeLinear" and len(consumer.input) >= 3:
-                        scale_name, zero_point_name = consumer.input[1], consumer.input[2]
-                        if scale_name in self.initializers and zero_point_name in self.initializers:
-                            layer_act["output"] = {
-                                "0": self._qparams_to_aimet_encoding(
-                                    self._to_torch_tensor(self.initializers[scale_name]),
-                                    self._to_torch_tensor(self.initializers[zero_point_name]),
-                                )
-                            }
-                            break
+                qparams = self._find_downstream_quant_params(
+                    node.output[0],
+                    {
+                        "Relu", "LeakyRelu", "Clip", "Sigmoid", "Softmax",
+                        "Add", "Mul", "Transpose", "Reshape", "Identity", "Cast",
+                        "Flatten", "Squeeze", "Unsqueeze", "GlobalAveragePool",
+                        "AveragePool", "MaxPool",
+                    },
+                )
+                if qparams:
+                    layer_act["output"] = {
+                        "0": self._qparams_to_aimet_encoding(qparams["scale"], qparams["zeropoint"])
+                    }
             if layer_act:
                 encodings[module_name] = layer_act
         return encodings
+
+    def _collect_activation_only_torch_state(self):
+        state_dict = {}
+        missing_input = []
+        missing_output = []
+
+        for node in self.onnx_model.graph.node:
+            if node.op_type not in self.ACTIVATION_ONLY_OPS:
+                continue
+
+            state_prefix = self._onnx_node_name_to_module(node.name)
+            input_found = False
+            for index, input_name in enumerate(node.input):
+                qparams = self._extract_qparams_from_dq_tensor(input_name)
+                if qparams is None:
+                    continue
+                suffix = "input" if index == 0 else f"input_{index}"
+                state_dict[f"{state_prefix}.{suffix}_scale"] = qparams["scale"]
+                state_dict[f"{state_prefix}.{suffix}_zero_point"] = qparams["zeropoint"]
+                input_found = True
+            if not input_found:
+                missing_input.append(state_prefix)
+
+            output_qparams = None
+            if node.output:
+                output_qparams = self._find_downstream_quant_params(
+                    node.output[0],
+                    {
+                        "Relu", "LeakyRelu", "Clip", "Sigmoid", "Softmax",
+                        "Add", "Mul", "Transpose", "Reshape", "Identity", "Cast",
+                        "Flatten", "Squeeze", "Unsqueeze", "GlobalAveragePool",
+                        "AveragePool", "MaxPool",
+                    },
+                )
+            if output_qparams is not None:
+                state_dict[f"{state_prefix}.output_scale"] = output_qparams["scale"]
+                state_dict[f"{state_prefix}.output_zero_point"] = output_qparams["zeropoint"]
+            else:
+                missing_output.append(state_prefix)
+
+        return state_dict, missing_input, missing_output
 
     def collect_encodings(self):
         activation_encodings = {}
@@ -478,6 +535,11 @@ class QuantizedOnnxExtractor(BaseExtractor):
             if not self._is_plain_model_initializer(initializer.name):
                 continue
             state_dict[self._onnx_name_to_state_key(initializer.name)] = self._to_torch_tensor(initializer).to(torch.float32)
+
+        activation_state, extra_missing_input, extra_missing_output = self._collect_activation_only_torch_state()
+        state_dict.update(activation_state)
+        missing_input.extend(extra_missing_input)
+        missing_output.extend(extra_missing_output)
 
         state_dict = self._postprocess_torch_state(state_dict)
         return state_dict, missing_input, missing_output

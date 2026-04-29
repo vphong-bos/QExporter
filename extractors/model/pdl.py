@@ -17,7 +17,7 @@ class PDLExtractor(QuantizedOnnxExtractor):
         return set()
 
     def _collect_activation_only_encodings(self):
-        encodings = {}
+        encodings = super()._collect_activation_only_encodings()
         for node in self.onnx_model.graph.node:
             if node.op_type != "Relu":
                 continue

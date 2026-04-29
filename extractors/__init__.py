@@ -38,7 +38,10 @@ def detect_source_format(source_path):
 
     model = onnx.load(str(source_path))
     op_types = {node.op_type for node in model.graph.node}
-    if {"QLinearConv", "QLinearMatMul"} & op_types:
+    if (
+        any(op_type.startswith("QLinear") for op_type in op_types)
+        or {"ConvInteger", "MatMulInteger"} & op_types
+    ):
         return "qop"
     if {"QuantizeLinear", "DequantizeLinear"} & op_types:
         return "qdq"
