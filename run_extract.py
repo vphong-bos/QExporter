@@ -247,6 +247,11 @@ def main():
         default=64,
         help="Head dimension used by --vit-attention-approx when approximating matmul_qk output scale.",
     )
+    parser.add_argument(
+        "--weights-path",
+        default=None,
+        help="Optional weights checkpoint used when exporting .pt from AIMET encodings.",
+    )
     args = parser.parse_args()
 
     if args.mode == "extract" and not args.output_path:
@@ -258,6 +263,7 @@ def main():
             args.vit_attention_approx or not args.no_vit_attention_approx
         )
         extractor_kwargs["attention_head_dim"] = args.vit_attention_head_dim
+        extractor_kwargs["weights_path"] = args.weights_path
 
     if args.mode == "analyze":
         source_format = args.source_format or detect_source_format(args.ckpt_path)

@@ -8,7 +8,7 @@ from .qop import QOPExtractor
 from .model.resnet import ResNetExtractor
 from .model.ssr import SSRExtractor
 from .model.pdl import PDLExtractor
-from .model.vit import ViTExtractor
+from .model.vit import ViTAimetExtractor, ViTExtractor
 
 MODEL_REGISTRY = {
     "resnet50": ResNetExtractor,
@@ -52,6 +52,8 @@ def create_extractor(source_path, model_name="generic", source_format=None, **ex
     source_format = source_format or detect_source_format(source_path)
 
     if source_format == "encodings":
+        if model_name == "vit":
+            return ViTAimetExtractor(source_path, **extractor_kwargs)
         return EncodingsExtractor(source_path)
     if source_format == "qop":
         if model_name != "generic":
