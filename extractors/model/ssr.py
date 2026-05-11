@@ -107,3 +107,12 @@ class SSRExtractor(QuantizedOnnxExtractor):
             return {"output"}
         
         return {"input", "output"}
+
+    def _get_torch_activation_roles(self, export_prefix):
+        """For SSR .pt export, request both sides where SSR actually quantizes both.
+
+        This keeps useful input/output qparams for debug exports while avoiding
+        false missing-input reports on output-only structures like norms,
+        embeddings, and certain attention helper projections.
+        """
+        return self._get_activation_roles(export_prefix)

@@ -14,6 +14,9 @@ Usage:
     # encodings -> encodings
     python run_extract.py generic input.encodings output.encodings
 
+    # SSR encodings + exported weights -> pt
+    python run_extract.py ssr model.encodings output.pt --weights-path model.pth --config ssr/projects/configs/SSR_e2e.py
+
     # Analyze operator usage / quantization coverage
     python run_extract.py generic model.onnx --mode analyze
 """
@@ -252,6 +255,31 @@ def main():
         default=None,
         help="Optional weights checkpoint used when exporting .pt from AIMET encodings.",
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Model config used when rebuilding a full torch model from encodings.",
+    )
+    parser.add_argument(
+        "--config-path",
+        default=None,
+        help="Optional AIMET quantsim config passed through to QuantizedSSR model import.",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="Device used when rebuilding a full torch model from encodings.",
+    )
+    parser.add_argument(
+        "--fuse-conv-bn",
+        action="store_true",
+        help="Apply mmcv fuse_conv_bn when rebuilding a full torch model from encodings.",
+    )
+    parser.add_argument(
+        "--enable-bn-fold",
+        action="store_true",
+        help="Enable AIMET BN fold when rebuilding a full torch model from encodings.",
+    )
     args = parser.parse_args()
 
     if args.mode == "extract" and not args.output_path:
@@ -263,7 +291,12 @@ def main():
             args.vit_attention_approx or not args.no_vit_attention_approx
         )
         extractor_kwargs["attention_head_dim"] = args.vit_attention_head_dim
-        extractor_kwargs["weights_path"] = args.weights_path
+    # extractor_kwargs["weights_path"] = args.weights_path
+    # extractor_kwargs["config"] = args.config
+    # extractor_kwargs["config_path"] = args.config_path
+    # extractor_kwargs["device"] = args.device
+    # extractor_kwargs["fuse_conv_bn"] = args.fuse_conv_bn
+    # extractor_kwargs["enable_bn_fold"] = args.enable_bn_fold
 
     if args.mode == "analyze":
         source_format = args.source_format or detect_source_format(args.ckpt_path)

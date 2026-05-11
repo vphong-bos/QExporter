@@ -54,7 +54,11 @@ def create_extractor(source_path, model_name="generic", source_format=None, **ex
     if source_format == "encodings":
         if model_name == "vit":
             return ViTAimetExtractor(source_path, **extractor_kwargs)
-        return EncodingsExtractor(source_path)
+        return EncodingsExtractor(
+            source_path,
+            model_name=model_name,
+            **extractor_kwargs,
+        )
     if source_format == "qop":
         if model_name != "generic":
             print(f"Ignoring model-specific extractor '{model_name}' for qop source format.")

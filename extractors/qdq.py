@@ -317,14 +317,28 @@ class QuantizedOnnxExtractor(BaseExtractor):
     def _get_torch_activation_roles(self, export_prefix):
         """Return activation qparam roles for .pt export.
 
-        By default this mirrors the encodings export behavior, but model-specific
-        extractors can override it when the target .pt naming/layout differs.
+        .pt exports are meant to preserve as much activation qparam information
+        as possible for downstream comparison/debugging, so the default behavior
+        is to emit both input and output qparams even if the encodings export is
+        more selective. Model-specific extractors can still override this when
+        the target .pt naming/layout differs.
         """
-        return self._get_activation_roles(export_prefix)
+        return {"input", "output"}
 
     def _postprocess_torch_state(self, state_dict):
         """Allow model-specific .pt export cleanup or augmentation."""
         return state_dict
+
+    @staticmethod
+    def _dedupe_preserve_order(values):
+        seen = set()
+        result = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
 
     def _collect_activation_only_encodings(self):
         encodings = {}
@@ -359,8 +373,6 @@ class QuantizedOnnxExtractor(BaseExtractor):
 
     def _collect_activation_only_torch_state(self):
         state_dict = {}
-        missing_input = []
-        missing_output = []
 
         for node in self.onnx_model.graph.node:
             if node.op_type not in self.ACTIVATION_ONLY_OPS:
@@ -376,8 +388,6 @@ class QuantizedOnnxExtractor(BaseExtractor):
                 state_dict[f"{state_prefix}.{suffix}_scale"] = qparams["scale"]
                 state_dict[f"{state_prefix}.{suffix}_zero_point"] = qparams["zeropoint"]
                 input_found = True
-            if not input_found:
-                missing_input.append(state_prefix)
 
             output_qparams = None
             if node.output:
@@ -393,10 +403,8 @@ class QuantizedOnnxExtractor(BaseExtractor):
             if output_qparams is not None:
                 state_dict[f"{state_prefix}.output_scale"] = output_qparams["scale"]
                 state_dict[f"{state_prefix}.output_zero_point"] = output_qparams["zeropoint"]
-            else:
-                missing_output.append(state_prefix)
 
-        return state_dict, missing_input, missing_output
+        return state_dict, [], []
 
     def collect_encodings(self):
         activation_encodings = {}
@@ -505,7 +513,7 @@ class QuantizedOnnxExtractor(BaseExtractor):
 
             compute_node = self._find_compute_node_from_weight_qdq(f"{prefix}.weight_qdq")
             if compute_node is None and "input" in roles:
-                missing_input.append(prefix)
+                missing_input.append(state_prefix)
 
             if "input" in roles and compute_node is not None:
                 activation_input_name = self._find_activation_input_name(compute_node, prefix)
@@ -514,7 +522,7 @@ class QuantizedOnnxExtractor(BaseExtractor):
                     state_dict[f"{state_prefix}.input_scale"] = input_qparams["scale"]
                     state_dict[f"{state_prefix}.input_zero_point"] = input_qparams["zeropoint"]
                 else:
-                    missing_input.append(prefix)
+                    missing_input.append(state_prefix)
 
             if "output" in roles:
                 output_qparams = self._find_output_quant_params(prefix, compute_node) if compute_node is not None else None
@@ -524,7 +532,7 @@ class QuantizedOnnxExtractor(BaseExtractor):
                     state_dict[f"{state_prefix}.output_scale"] = output_qparams["scale"]
                     state_dict[f"{state_prefix}.output_zero_point"] = output_qparams["zeropoint"]
                 else:
-                    missing_output.append(prefix)
+                    missing_output.append(state_prefix)
 
         for initializer in self.onnx_model.graph.initializer:
             if initializer.name in handled_initializer_names:
@@ -542,4 +550,8 @@ class QuantizedOnnxExtractor(BaseExtractor):
         missing_output.extend(extra_missing_output)
 
         state_dict = self._postprocess_torch_state(state_dict)
-        return state_dict, missing_input, missing_output
+        return (
+            state_dict,
+            self._dedupe_preserve_order(missing_input),
+            self._dedupe_preserve_order(missing_output),
+        )
