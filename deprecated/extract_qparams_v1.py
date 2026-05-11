@@ -24,6 +24,8 @@ class QuantizedOnnxExtractor:
 
     COMPUTE_OPS = {"Conv", "MatMul", "Gemm"}
 
+    ACTIVATION_ONLY_OPS = {"Relu", "MaxPool", "AveragePool", "GlobalAveragePool"}
+
     def __init__(self, ckpt_path):
         self.ckpt_path = str(ckpt_path)
         self.onnx_model = onnx.load(self.ckpt_path)
@@ -40,9 +42,8 @@ class QuantizedOnnxExtractor:
             for initializer in self.onnx_model.graph.initializer
         }
 
-    @classmethod
-    def _normalize_prefix(self, name):
-        # remove repeated wrappers like model.model.model...
+    @staticmethod
+    def _normalize_prefix(name):
         while name.startswith("model."):
             name = name[len("model.") :]
 
@@ -153,7 +154,6 @@ class QuantizedOnnxExtractor:
                 qmin, qmax = 0, 255
                 is_symmetric = "False"
 
-            # AIMET offset is typically negative zero-point shift
             offset = -zp
             enc_min = (qmin - zp) * s
             enc_max = (qmax - zp) * s
@@ -192,6 +192,12 @@ class QuantizedOnnxExtractor:
         }
 
     def _find_output_quant_params(self, prefix, compute_node):
+        downstream_ops = {
+            "BatchNormalization", "Relu", "Clip", "Add", "Transpose",
+            "Reshape", "Identity", "Cast", "Flatten", "Squeeze",
+            "Unsqueeze", "GlobalAveragePool", "AveragePool", "MaxPool",
+        }
+
         output_tensor_name = compute_node.output[0]
 
         if compute_node.op_type in {"MatMul", "Gemm"}:
@@ -202,20 +208,78 @@ class QuantizedOnnxExtractor:
                     output_tensor_name = consumer.output[0]
                     break
 
-        for consumer in self.consumers.get(output_tensor_name, []):
-            if consumer.op_type != "QuantizeLinear" or len(consumer.input) < 3:
+        queue = [output_tensor_name]
+        seen_tensors = set()
+
+        while queue:
+            tensor_name = queue.pop(0)
+            if tensor_name in seen_tensors:
                 continue
+            seen_tensors.add(tensor_name)
 
-            scale_name = consumer.input[1]
-            zero_point_name = consumer.input[2]
+            for consumer in self.consumers.get(tensor_name, []):
+                if consumer.op_type == "QuantizeLinear" and len(consumer.input) >= 3:
+                    scale_name = consumer.input[1]
+                    zero_point_name = consumer.input[2]
 
-            if scale_name in self.initializers and zero_point_name in self.initializers:
-                return {
-                    "scale": self._to_torch_tensor(self.initializers[scale_name]),
-                    "zeropoint": self._to_torch_tensor(self.initializers[zero_point_name]),
-                }
+                    if scale_name in self.initializers and zero_point_name in self.initializers:
+                        return {
+                            "scale": self._to_torch_tensor(self.initializers[scale_name]),
+                            "zeropoint": self._to_torch_tensor(self.initializers[zero_point_name]),
+                        }
+                elif consumer.op_type in downstream_ops:
+                    queue.extend(consumer.output)
 
         return None
+
+    @staticmethod
+    def _onnx_node_name_to_module(node_name):
+        name = node_name.lstrip('/')
+        parts = name.split('/')
+        if len(parts) > 1:
+            parts = parts[:-1]
+        filtered = []
+        for i, part in enumerate(parts):
+            if i + 1 < len(parts) and parts[i + 1].startswith(part + "."):
+                continue
+            filtered.append(part)
+        return '.'.join(filtered)
+
+    def _collect_activation_only_encodings(self):
+        encodings = {}
+
+        for node in self.onnx_model.graph.node:
+            if node.op_type != "Relu":
+                continue
+
+            module_name = self._onnx_node_name_to_module(node.name)
+
+            is_initial_relu = (module_name == "relu")
+            is_post_add_relu = module_name.endswith(".relu_2")
+            if not is_initial_relu and not is_post_add_relu:
+                continue
+
+            if is_post_add_relu:
+                module_name = module_name[:-2]
+
+            if node.output:
+                output_tensor = node.output[0]
+                for consumer in self.consumers.get(output_tensor, []):
+                    if consumer.op_type == "QuantizeLinear" and len(consumer.input) >= 3:
+                        scale_name = consumer.input[1]
+                        zp_name = consumer.input[2]
+                        if scale_name in self.initializers and zp_name in self.initializers:
+                            encodings[module_name] = {
+                                "output": {
+                                    "0": self._qparams_to_aimet_encoding(
+                                        self._to_torch_tensor(self.initializers[scale_name]),
+                                        self._to_torch_tensor(self.initializers[zp_name]),
+                                    )
+                                }
+                            }
+                            break
+
+        return encodings
 
     def collect_aimet_encodings(self):
         activation_encodings = {}
@@ -287,11 +351,13 @@ class QuantizedOnnxExtractor:
             if layer_act:
                 activation_encodings[export_prefix] = layer_act
 
+        activation_encodings.update(self._collect_activation_only_encodings())
+
         return {
             "activation_encodings": activation_encodings,
             "param_encodings": param_encodings,
         }, missing_input_qparams, missing_output_qparams
-    
+
     def save(self, output_path):
         encodings, missing_input_qparams, missing_output_qparams = self.collect_aimet_encodings()
 
@@ -311,6 +377,7 @@ class QuantizedOnnxExtractor:
             print(f"  - {prefix}")
 
         return encodings
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract quantized tensors and activation qparams from a QDQ ONNX model."
