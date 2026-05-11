@@ -234,21 +234,27 @@ def main():
         help="Output format. Defaults to inferring from output_path suffix.",
     )
     parser.add_argument(
+        "--attention-approx",
         "--vit-attention-approx",
+        dest="attention_approx",
         action="store_true",
-        help="For ViT .pt export, synthesize missing internal attention qparams "
-             "(matmul_qk / softmax / matmul_pv input) from attention-local heuristics.",
+        help="For attention-based .pt export, synthesize missing internal attention qparams "
+             "(for example matmul_qk / softmax / matmul_pv inputs) from attention-local heuristics.",
     )
     parser.add_argument(
+        "--no-attention-approx",
         "--no-vit-attention-approx",
+        dest="no_attention_approx",
         action="store_true",
-        help="Disable synthesized internal ViT attention qparams for .pt export.",
+        help="Disable synthesized internal attention qparams for .pt export.",
     )
     parser.add_argument(
+        "--attention-head-dim",
         "--vit-attention-head-dim",
+        dest="attention_head_dim",
         type=int,
         default=64,
-        help="Head dimension used by --vit-attention-approx when approximating matmul_qk output scale.",
+        help="Head dimension used by --attention-approx when approximating matmul_qk output scale.",
     )
     parser.add_argument(
         "--weights-path",
@@ -286,11 +292,11 @@ def main():
         parser.error("output_path is required in --mode extract")
 
     extractor_kwargs = {}
-    if args.model == "vit":
+    if args.model in {"vit", "ssr"}:
         extractor_kwargs["approximate_attention_qparams"] = (
-            args.vit_attention_approx or not args.no_vit_attention_approx
+            args.attention_approx or not args.no_attention_approx
         )
-        extractor_kwargs["attention_head_dim"] = args.vit_attention_head_dim
+        extractor_kwargs["attention_head_dim"] = args.attention_head_dim
     # extractor_kwargs["weights_path"] = args.weights_path
     # extractor_kwargs["config"] = args.config
     # extractor_kwargs["config_path"] = args.config_path

@@ -9,8 +9,15 @@ from ..qdq import QuantizedOnnxExtractor
 
 
 class SSRExtractor(QuantizedOnnxExtractor):
-    def __init__(self, ckpt_path):
+    def __init__(
+        self,
+        ckpt_path,
+        approximate_attention_qparams=True,
+        attention_head_dim=64,
+    ):
         super().__init__(ckpt_path)
+        self.approximate_attention_qparams = approximate_attention_qparams
+        self.attention_head_dim = attention_head_dim
         
         self.passthrough_ops = self.passthrough_ops | {
             "Mul", "Add", "Sub", "Div",
@@ -116,3 +123,106 @@ class SSRExtractor(QuantizedOnnxExtractor):
         embeddings, and certain attention helper projections.
         """
         return self._get_activation_roles(export_prefix)
+
+    @staticmethod
+    def _scalar_tensor(value, dtype=None):
+        import torch
+
+        tensor_dtype = torch.float32 if dtype is None else dtype
+        return torch.tensor(float(value), dtype=tensor_dtype)
+
+    def _attention_prefixes(self, state_dict):
+        prefixes = set()
+        for key in state_dict:
+            if ".attn.q_proj." in key:
+                prefixes.add(key.split(".q_proj.", 1)[0])
+        return sorted(prefixes)
+
+    def _add_attention_pair(self, state_dict, prefix, suffix, scale, zero_point):
+        scale_key = f"{prefix}.{suffix}_scale"
+        zp_key = f"{prefix}.{suffix}_zero_point"
+        if scale_key not in state_dict:
+            state_dict[scale_key] = scale.clone() if hasattr(scale, "clone") else scale
+        if zp_key not in state_dict:
+            state_dict[zp_key] = zero_point.clone() if hasattr(zero_point, "clone") else zero_point
+
+    def _add_attention_alias_pair(self, state_dict, prefixes, suffix, scale, zero_point):
+        for prefix in prefixes:
+            self._add_attention_pair(state_dict, prefix, suffix, scale, zero_point)
+
+    def _add_approx_attention_qparams(self, state_dict):
+        import math
+        import torch
+
+        for attention_prefix in self._attention_prefixes(state_dict):
+            q_out_scale = state_dict.get(f"{attention_prefix}.q_proj.output_scale")
+            k_out_scale = state_dict.get(f"{attention_prefix}.k_proj.output_scale")
+            q_out_zp = state_dict.get(f"{attention_prefix}.q_proj.output_zero_point")
+            v_out_scale = state_dict.get(f"{attention_prefix}.v_proj.output_scale")
+            v_out_zp = state_dict.get(f"{attention_prefix}.v_proj.output_zero_point")
+            softmax_out_scale = state_dict.get(f"{attention_prefix}.softmax.output_scale")
+            softmax_out_zp = state_dict.get(f"{attention_prefix}.softmax.output_zero_point")
+
+            if q_out_scale is not None and k_out_scale is not None:
+                query_qk_prefix = f"{attention_prefix}.query_qk"
+                matmul_qk_prefix = f"{attention_prefix}.matmul_qk"
+                qk_scale_key = f"{query_qk_prefix}.output_scale"
+                qk_zp_key = f"{query_qk_prefix}.output_zero_point"
+                if qk_scale_key not in state_dict:
+                    approx_scale = (
+                        q_out_scale.to(torch.float32) * k_out_scale.to(torch.float32)
+                        * (127.0 * math.sqrt(float(self.attention_head_dim)))
+                    )
+                    state_dict[qk_scale_key] = approx_scale
+                    if qk_zp_key not in state_dict:
+                        if q_out_zp is not None and q_out_zp.numel() == 1:
+                            state_dict[qk_zp_key] = q_out_zp.clone()
+                        else:
+                            state_dict[qk_zp_key] = torch.tensor(128.0, dtype=torch.float32)
+                self._add_attention_alias_pair(
+                    state_dict,
+                    [matmul_qk_prefix],
+                    "output",
+                    state_dict[qk_scale_key],
+                    state_dict[qk_zp_key],
+                )
+
+                query_qk_scale = state_dict.get(qk_scale_key)
+                query_qk_zp = state_dict.get(qk_zp_key)
+                if query_qk_scale is not None and query_qk_zp is not None:
+                    self._add_attention_alias_pair(
+                        state_dict,
+                        [f"{attention_prefix}.softmax"],
+                        "input",
+                        query_qk_scale,
+                        query_qk_zp,
+                    )
+
+            if softmax_out_scale is not None and softmax_out_zp is not None:
+                self._add_attention_alias_pair(
+                    state_dict,
+                    [
+                        f"{attention_prefix}.query_pv",
+                        f"{attention_prefix}.matmul_pv",
+                    ],
+                    "input",
+                    softmax_out_scale,
+                    softmax_out_zp,
+                )
+
+            if v_out_scale is not None and v_out_zp is not None:
+                self._add_attention_alias_pair(
+                    state_dict,
+                    [
+                        f"{attention_prefix}.query_pv",
+                        f"{attention_prefix}.matmul_pv",
+                    ],
+                    "input_1",
+                    v_out_scale,
+                    v_out_zp,
+                )
+
+    def _postprocess_torch_state(self, state_dict):
+        if self.approximate_attention_qparams:
+            self._add_approx_attention_qparams(state_dict)
+        return state_dict
