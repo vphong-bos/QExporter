@@ -136,11 +136,31 @@ class EncodingsExtractor(BaseExtractor):
         from mmdet.models.losses.focal_loss import FocalLoss
         from mmdet.models.losses.iou_loss import GIoULoss
         from mmdet.models.losses.smooth_l1_loss import L1Loss
+        from ssr.projects.mmdet3d_plugin.SSR.modules.temporal_self_attention import DummyQuant
 
         QuantizationMixin.ignore(FocalLoss)
         QuantizationMixin.ignore(L1Loss)
         QuantizationMixin.ignore(GIoULoss)
         QuantizationMixin.ignore(Dropout)
+
+        @QuantizationMixin.implements(DummyQuant)
+        class QuantizedDummyQuant(QuantizationMixin, DummyQuant):
+            def __quant_init__(self):
+                super().__quant_init__()
+                self.input_quantizers = torch.nn.ModuleList([None])
+                self.output_quantizers = torch.nn.ModuleList([None])
+
+            def forward(self, x):
+                if self.input_quantizers[0]:
+                    x = self.input_quantizers[0](x)
+
+                with self._patch_quantized_parameters():
+                    ret = super().forward(x)
+
+                if self.output_quantizers[0]:
+                    ret = self.output_quantizers[0](ret)
+
+                return ret
 
         # Import registers QuantizedLinear and related quantized op hooks.
         from quantization.registered_ops import QuantizedLinear  # noqa: F401

@@ -5,6 +5,8 @@
 # Missing output qparams (1):
 #   - model.pts_bbox_head.tokenlearner.layer_norm
 
+import copy
+
 from ..qdq import QuantizedOnnxExtractor
 
 
@@ -133,9 +135,12 @@ class SSRExtractor(QuantizedOnnxExtractor):
 
     def _attention_prefixes(self, state_dict):
         prefixes = set()
+        projection_markers = (".q_proj.", ".k_proj.", ".v_proj.")
         for key in state_dict:
-            if ".attn.q_proj." in key:
-                prefixes.add(key.split(".q_proj.", 1)[0])
+            for marker in projection_markers:
+                if marker in key:
+                    prefixes.add(key.split(marker, 1)[0])
+                    break
         return sorted(prefixes)
 
     def _add_attention_pair(self, state_dict, prefix, suffix, scale, zero_point):
@@ -149,6 +154,91 @@ class SSRExtractor(QuantizedOnnxExtractor):
     def _add_attention_alias_pair(self, state_dict, prefixes, suffix, scale, zero_point):
         for prefix in prefixes:
             self._add_attention_pair(state_dict, prefix, suffix, scale, zero_point)
+
+    def _fill_missing_attention_proj_inputs(self, state_dict):
+        for attention_prefix in self._attention_prefixes(state_dict):
+            source_pairs = [
+                (
+                    state_dict.get(f"{attention_prefix}.q_proj.input_scale"),
+                    state_dict.get(f"{attention_prefix}.q_proj.input_zero_point"),
+                ),
+                (
+                    state_dict.get(f"{attention_prefix}.k_proj.input_scale"),
+                    state_dict.get(f"{attention_prefix}.k_proj.input_zero_point"),
+                ),
+                (
+                    state_dict.get(f"{attention_prefix}.v_proj.input_scale"),
+                    state_dict.get(f"{attention_prefix}.v_proj.input_zero_point"),
+                ),
+                (
+                    state_dict.get(f"{attention_prefix.rsplit('.attn', 1)[0]}.input_1_scale"),
+                    state_dict.get(f"{attention_prefix.rsplit('.attn', 1)[0]}.input_1_zero_point"),
+                ),
+                (
+                    state_dict.get(f"{attention_prefix.rsplit('.attn', 1)[0]}.input_scale"),
+                    state_dict.get(f"{attention_prefix.rsplit('.attn', 1)[0]}.input_zero_point"),
+                ),
+            ]
+
+            fallback_scale = None
+            fallback_zero_point = None
+            for scale, zero_point in source_pairs:
+                if scale is not None and zero_point is not None:
+                    fallback_scale = scale
+                    fallback_zero_point = zero_point
+                    break
+
+            if fallback_scale is None or fallback_zero_point is None:
+                continue
+
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                self._add_attention_pair(
+                    state_dict,
+                    f"{attention_prefix}.{proj_name}",
+                    "input",
+                    fallback_scale,
+                    fallback_zero_point,
+                )
+
+    def _fill_missing_attention_proj_inputs_in_encodings(self, encodings):
+        activation_encodings = encodings.setdefault("activation_encodings", {})
+        attention_prefixes = set()
+        for name in activation_encodings:
+            for marker in (".q_proj", ".k_proj", ".v_proj"):
+                if marker in name and ".attn." in name:
+                    attention_prefixes.add(name.rsplit(marker, 1)[0])
+                    break
+
+        for attention_prefix in sorted(attention_prefixes):
+            parent_prefix = attention_prefix.rsplit('.attn', 1)[0]
+            fallback_encoding = None
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                proj_entry = activation_encodings.get(f"{attention_prefix}.{proj_name}")
+                if not proj_entry:
+                    continue
+                input_entry = proj_entry.get("input", {})
+                if "0" in input_entry:
+                    fallback_encoding = copy.deepcopy(input_entry["0"])
+                    break
+
+            if fallback_encoding is None:
+                parent_entry = activation_encodings.get(parent_prefix, {})
+                parent_inputs = parent_entry.get("input", {}) if isinstance(parent_entry, dict) else {}
+                for index in ("1", "0"):
+                    if index in parent_inputs:
+                        fallback_encoding = copy.deepcopy(parent_inputs[index])
+                        break
+
+            if fallback_encoding is None:
+                continue
+
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                proj_key = f"{attention_prefix}.{proj_name}"
+                proj_entry = activation_encodings.setdefault(proj_key, {})
+                proj_entry.setdefault("input", {})
+                proj_entry["input"].setdefault("0", copy.deepcopy(fallback_encoding))
+
+        return encodings
 
     def _add_approx_attention_qparams(self, state_dict):
         import math
@@ -223,6 +313,28 @@ class SSRExtractor(QuantizedOnnxExtractor):
                 )
 
     def _postprocess_torch_state(self, state_dict):
+        self._fill_missing_attention_proj_inputs(state_dict)
         if self.approximate_attention_qparams:
             self._add_approx_attention_qparams(state_dict)
         return state_dict
+
+    def collect_torch_state(self):
+        state_dict, missing_input, missing_output = super().collect_torch_state()
+        missing_input = [
+            prefix
+            for prefix in missing_input
+            if f"{prefix}.input_scale" not in state_dict
+            or f"{prefix}.input_zero_point" not in state_dict
+        ]
+        return state_dict, missing_input, missing_output
+
+    def collect_encodings(self):
+        encodings, missing_input, missing_output = super().collect_encodings()
+        encodings = self._fill_missing_attention_proj_inputs_in_encodings(encodings)
+        activation_encodings = encodings.get("activation_encodings", {})
+        missing_input = [
+            prefix
+            for prefix in missing_input
+            if "0" not in activation_encodings.get(self._normalize_prefix(prefix), {}).get("input", {})
+        ]
+        return encodings, missing_input, missing_output
