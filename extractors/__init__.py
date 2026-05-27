@@ -17,14 +17,16 @@ MODEL_REGISTRY = {
     "ssr": SSRExtractor,
     "pdl": PDLExtractor,
     "vit": ViTExtractor,
+    "generic": QuantizedOnnxExtractor,
 }
 
 
 def get_extractor(model_name):
     cls = MODEL_REGISTRY.get(model_name)
     if cls is None:
-        supported = ", ".join(sorted(MODEL_REGISTRY.keys()))
-        raise ValueError(f"Unknown model '{model_name}'. Supported: {supported}")
+        cls = MODEL_REGISTRY["generic"]
+        # supported = ", ".join(sorted(MODEL_REGISTRY.keys()))
+        # raise ValueError(f"Unknown model '{model_name}'. Supported: {supported}")
     return cls
 
 
