@@ -17,14 +17,16 @@ MODEL_REGISTRY = {
     "ssr": SSRExtractor,
     "pdl": PDLExtractor,
     "vit": ViTExtractor,
+    "generic": QuantizedOnnxExtractor,
 }
 
 
 def get_extractor(model_name):
     cls = MODEL_REGISTRY.get(model_name)
     if cls is None:
-        supported = ", ".join(sorted(MODEL_REGISTRY.keys()))
-        raise ValueError(f"Unknown model '{model_name}'. Supported: {supported}")
+        cls = MODEL_REGISTRY["generic"]
+        # supported = ", ".join(sorted(MODEL_REGISTRY.keys()))
+        # raise ValueError(f"Unknown model '{model_name}'. Supported: {supported}")
     return cls
 
 
@@ -54,7 +56,11 @@ def create_extractor(source_path, model_name="generic", source_format=None, **ex
     if source_format == "encodings":
         if model_name == "vit":
             return ViTAimetExtractor(source_path, **extractor_kwargs)
-        return EncodingsExtractor(source_path)
+        return EncodingsExtractor(
+            source_path,
+            model_name=model_name,
+            **extractor_kwargs,
+        )
     if source_format == "qop":
         if model_name != "generic":
             print(f"Ignoring model-specific extractor '{model_name}' for qop source format.")

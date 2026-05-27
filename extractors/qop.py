@@ -1,3 +1,4 @@
+import copy
 import onnx
 import torch
 from onnx import numpy_helper
@@ -111,6 +112,62 @@ class QOPExtractor(BaseExtractor):
         layer_act.setdefault("input", {})[str(index)] = self._qparams_to_aimet_encoding(scale_tensor, zero_point_tensor)
         return True
 
+
+
+    def _attention_projection_prefixes(self, values):
+        prefixes = set()
+        projection_markers = (".q_proj", ".k_proj", ".v_proj")
+        for value in values:
+            for marker in projection_markers:
+                if marker in value and ".attn." in value:
+                    prefixes.add(value.split(marker, 1)[0])
+                    break
+        return sorted(prefixes)
+
+    def _fill_missing_attention_proj_inputs_state(self, state_dict):
+        for attention_prefix in self._attention_projection_prefixes(state_dict.keys()):
+            fallback_scale = None
+            fallback_zero_point = None
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                scale = state_dict.get(f"{attention_prefix}.{proj_name}.input_scale")
+                zero_point = state_dict.get(f"{attention_prefix}.{proj_name}.input_zero_point")
+                if scale is not None and zero_point is not None:
+                    fallback_scale = scale
+                    fallback_zero_point = zero_point
+                    break
+
+            if fallback_scale is None or fallback_zero_point is None:
+                continue
+
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                state_dict.setdefault(
+                    f"{attention_prefix}.{proj_name}.input_scale",
+                    fallback_scale.clone() if hasattr(fallback_scale, "clone") else fallback_scale,
+                )
+                state_dict.setdefault(
+                    f"{attention_prefix}.{proj_name}.input_zero_point",
+                    fallback_zero_point.clone() if hasattr(fallback_zero_point, "clone") else fallback_zero_point,
+                )
+
+    def _fill_missing_attention_proj_inputs_encodings(self, activation_encodings):
+        for attention_prefix in self._attention_projection_prefixes(activation_encodings.keys()):
+            fallback_encoding = None
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                proj_entry = activation_encodings.get(f"{attention_prefix}.{proj_name}")
+                if not proj_entry:
+                    continue
+                input_entry = proj_entry.get("input", {})
+                if "0" in input_entry:
+                    fallback_encoding = copy.deepcopy(input_entry["0"])
+                    break
+
+            if fallback_encoding is None:
+                continue
+
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                proj_entry = activation_encodings.setdefault(f"{attention_prefix}.{proj_name}", {})
+                proj_entry.setdefault("input", {})
+                proj_entry["input"].setdefault("0", copy.deepcopy(fallback_encoding))
     def collect_encodings(self):
         activation_encodings = {}
         param_encodings = {}
@@ -169,6 +226,13 @@ class QOPExtractor(BaseExtractor):
 
             if layer_act:
                 activation_encodings[prefix] = layer_act
+
+        self._fill_missing_attention_proj_inputs_encodings(activation_encodings)
+        missing_input = [
+            prefix
+            for prefix in missing_input
+            if "0" not in activation_encodings.get(prefix, {}).get("input", {})
+        ]
 
         return {
             "activation_encodings": activation_encodings,
@@ -253,4 +317,11 @@ class QOPExtractor(BaseExtractor):
                 state_dict[f"{prefix}.weight"] = self._to_torch(self.init_map[inputs[1]])
             missing_output.append(prefix)
 
+        self._fill_missing_attention_proj_inputs_state(state_dict)
+        missing_input = [
+            prefix
+            for prefix in missing_input
+            if f"{prefix}.input_scale" not in state_dict
+            or f"{prefix}.input_zero_point" not in state_dict
+        ]
         return state_dict, missing_input, missing_output

@@ -264,19 +264,95 @@ class QuantizedOnnxExtractor(BaseExtractor):
         state_dict[state_key] = weight
         return True
 
-    @staticmethod
-    def _onnx_node_name_to_module(node_name):
-        name = node_name.lstrip("/")
-        parts = name.split("/")
-        if len(parts) > 1:
-            parts = parts[:-1]
-        filtered = []
-        for index, part in enumerate(parts):
-            if index + 1 < len(parts) and parts[index + 1].startswith(part + "."):
-                continue
-            filtered.append(part)
-        return ".".join(filtered)
+    # @staticmethod
+    # def _onnx_node_name_to_module(node_name, op_type=None):
+    #     name = node_name.strip("/")
+    #     if not name:
+    #         return ""
 
+    #     parts = [part for part in name.split("/") if part]
+
+    #     if op_type is not None and len(parts) > 1:
+    #         last = parts[-1]
+    #         if last == op_type or last.startswith(f"{op_type}_"):
+    #             parts = parts[:-1]
+
+    #     return ".".join(parts)
+
+    @staticmethod
+    def _onnx_node_name_to_module(node_name, op_type=None):
+        metadata_props = getattr(node_name, "metadata_props", None)
+
+        if metadata_props is not None:
+            node = node_name
+
+            metadata_scope = None
+            for prop in metadata_props:
+                if prop.key == "pkg.torch.onnx.name_scopes":
+                    metadata_scope = prop.value
+                    break
+
+            if metadata_scope:
+                # Metadata may be a Python-list-looking string:
+                #   "['', 'model', 'model.topdown', ..., 'model.topdown.7.relu2', 'relu_38']"
+                # Prefer [-2] because [-1] is often the generated ONNX node name.
+                try:
+                    import ast
+
+                    scopes = ast.literal_eval(metadata_scope)
+                    if isinstance(scopes, (list, tuple)):
+                        scopes = [str(scope).strip() for scope in scopes if str(scope).strip()]
+                        if len(scopes) >= 2:
+                            name = scopes[-2]
+                        elif len(scopes) == 1:
+                            name = scopes[-1]
+                        else:
+                            name = getattr(node, "name", "")
+                    else:
+                        name = str(metadata_scope)
+                except Exception:
+                    # Fallback for non-list metadata strings.
+                    name = str(metadata_scope)
+            else:
+                name = getattr(node, "name", "")
+
+            if op_type is None:
+                op_type = getattr(node, "op_type", None)
+
+        else:
+            name = node_name.name if hasattr(node_name, "name") else str(node_name)
+
+        name = str(name).strip()
+        name = name.strip("/")
+        if not name:
+            return ""
+
+        # If non-list metadata contains multiple scopes, prefer [-2] if possible,
+        # otherwise [-1]. This mirrors the list behavior above.
+        for sep in ("\n", ";", ","):
+            if sep in name:
+                parts = [part.strip().strip("'\"") for part in name.split(sep) if part.strip()]
+                if len(parts) >= 2:
+                    name = parts[-2]
+                elif parts:
+                    name = parts[-1]
+                break
+
+        name = name.strip("/")
+        if not name:
+            return ""
+
+        parts = [part for part in name.split("/") if part]
+
+        # Only strip op_type if it is a separate slash-path tail.
+        # Do not strip from single-component dotted names like frontend.node_add.
+        if op_type is not None and len(parts) > 1:
+            last = parts[-1]
+            if last == op_type or last.startswith(f"{op_type}_"):
+                parts = parts[:-1]
+
+        return ".".join(parts)
+    
     @staticmethod
     def _to_python(value):
         if isinstance(value, torch.Tensor):
@@ -317,21 +393,36 @@ class QuantizedOnnxExtractor(BaseExtractor):
     def _get_torch_activation_roles(self, export_prefix):
         """Return activation qparam roles for .pt export.
 
-        By default this mirrors the encodings export behavior, but model-specific
-        extractors can override it when the target .pt naming/layout differs.
+        .pt exports are meant to preserve as much activation qparam information
+        as possible for downstream comparison/debugging, so the default behavior
+        is to emit both input and output qparams even if the encodings export is
+        more selective. Model-specific extractors can still override this when
+        the target .pt naming/layout differs.
         """
-        return self._get_activation_roles(export_prefix)
+        return {"input", "output"}
 
     def _postprocess_torch_state(self, state_dict):
         """Allow model-specific .pt export cleanup or augmentation."""
         return state_dict
+
+    @staticmethod
+    def _dedupe_preserve_order(values):
+        seen = set()
+        result = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
 
     def _collect_activation_only_encodings(self):
         encodings = {}
         for node in self.onnx_model.graph.node:
             if node.op_type not in self.ACTIVATION_ONLY_OPS:
                 continue
-            module_name = self._onnx_node_name_to_module(node.name)
+            # module_name = self._onnx_node_name_to_module(node.name)
+            module_name = self._onnx_node_name_to_module(node)
             layer_act = {}
             for index, input_name in enumerate(node.input):
                 qparams = self._extract_qparams_from_dq_tensor(input_name)
@@ -357,27 +448,37 @@ class QuantizedOnnxExtractor(BaseExtractor):
                 encodings[module_name] = layer_act
         return encodings
 
+    @staticmethod
+    def _activation_input_suffix(node, index):
+        if len(node.input) <= 1:
+            return "input"
+        return f"input_{index}"
+
     def _collect_activation_only_torch_state(self):
         state_dict = {}
-        missing_input = []
-        missing_output = []
 
         for node in self.onnx_model.graph.node:
             if node.op_type not in self.ACTIVATION_ONLY_OPS:
                 continue
 
-            state_prefix = self._onnx_node_name_to_module(node.name)
+            # state_prefix = self._onnx_node_name_to_module(node.name)
+            state_prefix = self._onnx_node_name_to_module(node)
+            print(
+                "[activation-name]",
+                f"op_type={node.op_type}",
+                f"raw={node.name!r}",
+                f"parsed={state_prefix!r}",
+            )
             input_found = False
             for index, input_name in enumerate(node.input):
                 qparams = self._extract_qparams_from_dq_tensor(input_name)
                 if qparams is None:
                     continue
-                suffix = "input" if index == 0 else f"input_{index}"
+
+                suffix = self._activation_input_suffix(node, index)
                 state_dict[f"{state_prefix}.{suffix}_scale"] = qparams["scale"]
                 state_dict[f"{state_prefix}.{suffix}_zero_point"] = qparams["zeropoint"]
                 input_found = True
-            if not input_found:
-                missing_input.append(state_prefix)
 
             output_qparams = None
             if node.output:
@@ -393,10 +494,8 @@ class QuantizedOnnxExtractor(BaseExtractor):
             if output_qparams is not None:
                 state_dict[f"{state_prefix}.output_scale"] = output_qparams["scale"]
                 state_dict[f"{state_prefix}.output_zero_point"] = output_qparams["zeropoint"]
-            else:
-                missing_output.append(state_prefix)
 
-        return state_dict, missing_input, missing_output
+        return state_dict, [], []
 
     def collect_encodings(self):
         activation_encodings = {}
@@ -505,7 +604,7 @@ class QuantizedOnnxExtractor(BaseExtractor):
 
             compute_node = self._find_compute_node_from_weight_qdq(f"{prefix}.weight_qdq")
             if compute_node is None and "input" in roles:
-                missing_input.append(prefix)
+                missing_input.append(state_prefix)
 
             if "input" in roles and compute_node is not None:
                 activation_input_name = self._find_activation_input_name(compute_node, prefix)
@@ -514,7 +613,7 @@ class QuantizedOnnxExtractor(BaseExtractor):
                     state_dict[f"{state_prefix}.input_scale"] = input_qparams["scale"]
                     state_dict[f"{state_prefix}.input_zero_point"] = input_qparams["zeropoint"]
                 else:
-                    missing_input.append(prefix)
+                    missing_input.append(state_prefix)
 
             if "output" in roles:
                 output_qparams = self._find_output_quant_params(prefix, compute_node) if compute_node is not None else None
@@ -524,7 +623,7 @@ class QuantizedOnnxExtractor(BaseExtractor):
                     state_dict[f"{state_prefix}.output_scale"] = output_qparams["scale"]
                     state_dict[f"{state_prefix}.output_zero_point"] = output_qparams["zeropoint"]
                 else:
-                    missing_output.append(prefix)
+                    missing_output.append(state_prefix)
 
         for initializer in self.onnx_model.graph.initializer:
             if initializer.name in handled_initializer_names:
@@ -542,4 +641,8 @@ class QuantizedOnnxExtractor(BaseExtractor):
         missing_output.extend(extra_missing_output)
 
         state_dict = self._postprocess_torch_state(state_dict)
-        return state_dict, missing_input, missing_output
+        return (
+            state_dict,
+            self._dedupe_preserve_order(missing_input),
+            self._dedupe_preserve_order(missing_output),
+        )
