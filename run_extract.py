@@ -2,20 +2,23 @@
 """Extract quantization data from ONNX or existing encodings files.
 
 Usage:
-    # QDQ ONNX -> encodings
-    python run_extract.py resnet50 model.onnx output.encodings.json
+    # QDQ ONNX -> encodings (auto output: qparams/model.encodings)
+    python run_extract.py resnet50 model.onnx
+
+    # QDQ ONNX -> encodings with custom output name in qparams/
+    python run_extract.py resnet50 model.onnx custom_name.encodings
 
     # QDQ ONNX -> pt
-    python run_extract.py generic model.onnx output.pt
+    python run_extract.py generic model.onnx --format pt
 
     # QOP ONNX -> pt
     python run_extract.py generic model_qop.onnx output.pt --source-format qop
 
     # encodings -> encodings
-    python run_extract.py generic input.encodings output.encodings
+    python run_extract.py generic input.encodings
 
     # SSR encodings + exported weights -> pt
-    python run_extract.py ssr model.encodings output.pt --weights-path model.pth --config ssr/projects/configs/SSR_e2e.py
+    python run_extract.py ssr model.encodings --format pt --weights-path model.pth --config ssr/projects/configs/SSR_e2e.py
 
     # Analyze operator usage / quantization coverage
     python run_extract.py generic model.onnx --mode analyze
@@ -200,6 +203,34 @@ def save_analysis(result, output_path=None):
         print(payload)
 
 
+def resolve_output_path(ckpt_path, output_path=None, output_format=None, mode="extract"):
+    source_path = Path(ckpt_path)
+    qparams_dir = Path("qparams")
+
+    if mode == "analyze":
+        if output_path is None:
+            return None
+        resolved = Path(output_path)
+        if not resolved.is_absolute() and resolved.parent == Path("."):
+            resolved = qparams_dir / resolved
+        if resolved.suffix == "":
+            resolved = resolved.with_suffix(".analysis.json")
+        return resolved
+
+    resolved_format = output_format or "encodings"
+    default_suffix = ".pt" if resolved_format == "pt" else ".encodings"
+
+    if output_path is None:
+        return qparams_dir / f"{source_path.stem}{default_suffix}"
+
+    resolved = Path(output_path)
+    if not resolved.is_absolute() and resolved.parent == Path("."):
+        resolved = qparams_dir / resolved
+    if resolved.suffix == "":
+        resolved = resolved.with_suffix(default_suffix)
+    return resolved
+
+
 def main():
     supported = ", ".join(sorted(MODEL_REGISTRY.keys())) + ", generic"
 
@@ -211,8 +242,8 @@ def main():
     parser.add_argument(
         "output_path",
         nargs="?",
-        help="Path to save the extracted output (.encodings/.json or .pt/.pth). "
-             "Optional in --mode analyze; if omitted, analysis is printed.",
+        help="Optional output filename or path. Relative names are saved in qparams/. "
+             "If omitted in extract mode, defaults to qparams/<input_stem>.encodings.",
     )
     parser.add_argument(
         "--mode",
@@ -223,15 +254,15 @@ def main():
     parser.add_argument(
         "--source-format",
         choices=("qdq", "qop", "encodings"),
-        default=None,
+        default="qdq",
         help="Source format. Defaults to auto-detection from the input file.",
     )
     parser.add_argument(
         "--format",
         dest="output_format",
         choices=("encodings", "pt"),
-        default=None,
-        help="Output format. Defaults to inferring from output_path suffix.",
+        default="pt",
+        help="Output format. Defaults to inferring from output_path suffix, or encodings when output_path is omitted.",
     )
     parser.add_argument(
         "--attention-approx",
@@ -288,9 +319,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.mode == "extract" and not args.output_path:
-        parser.error("output_path is required in --mode extract")
-
     extractor_kwargs = {}
     if args.model in {"vit", "ssr"}:
         extractor_kwargs["approximate_attention_qparams"] = (
@@ -307,16 +335,27 @@ def main():
     if args.mode == "analyze":
         source_format = args.source_format or detect_source_format(args.ckpt_path)
         result = analyze_model(args.ckpt_path, source_format)
-        save_analysis(result, args.output_path)
+        resolved_output_path = resolve_output_path(
+            args.ckpt_path,
+            output_path=args.output_path,
+            mode="analyze",
+        )
+        save_analysis(result, resolved_output_path)
         return
 
+    resolved_output_path = resolve_output_path(
+        args.ckpt_path,
+        output_path=args.output_path,
+        output_format=args.output_format,
+        mode="extract",
+    )
     extractor = create_extractor(
         args.ckpt_path,
         model_name=args.model,
         source_format=args.source_format,
         **extractor_kwargs,
     )
-    extractor.save(args.output_path, output_format=args.output_format)
+    extractor.save(resolved_output_path, output_format=args.output_format)
 
 
 if __name__ == "__main__":
