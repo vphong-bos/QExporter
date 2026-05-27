@@ -463,12 +463,12 @@ class QuantizedOnnxExtractor(BaseExtractor):
 
             # state_prefix = self._onnx_node_name_to_module(node.name)
             state_prefix = self._onnx_node_name_to_module(node)
-            print(
-                "[activation-name]",
-                f"op_type={node.op_type}",
-                f"raw={node.name!r}",
-                f"parsed={state_prefix!r}",
-            )
+            # print(
+            #     "[activation-name]",
+            #     f"op_type={node.op_type}",
+            #     f"raw={node.name!r}",
+            #     f"parsed={state_prefix!r}",
+            # )
             input_found = False
             for index, input_name in enumerate(node.input):
                 qparams = self._extract_qparams_from_dq_tensor(input_name)
