@@ -80,7 +80,7 @@ class QuantizedOnnxExtractor(BaseExtractor):
 
     @staticmethod
     def _normalize_prefix(name):
-        for wrapper in ("model.", "module.", "_orig_mod."):
+        for wrapper in ("module.", "_orig_mod."):
             while name.startswith(wrapper):
                 name = name[len(wrapper):]
         return name

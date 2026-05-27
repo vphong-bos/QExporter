@@ -254,14 +254,14 @@ def main():
     parser.add_argument(
         "--source-format",
         choices=("qdq", "qop", "encodings"),
-        default=None,
+        default="qdq",
         help="Source format. Defaults to auto-detection from the input file.",
     )
     parser.add_argument(
         "--format",
         dest="output_format",
         choices=("encodings", "pt"),
-        default=None,
+        default="pt",
         help="Output format. Defaults to inferring from output_path suffix, or encodings when output_path is omitted.",
     )
     parser.add_argument(
