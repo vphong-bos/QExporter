@@ -83,33 +83,13 @@ class SSRExtractor(QuantizedOnnxExtractor):
             "Where", "RoiAlign", "Pad", "Slice", "Resize",
         }
 
-    @classmethod
-    def _collapse_ssr_duplicate_layer_segments(cls, prefix):
-        """Reduce names like:
-            model.backbone.layer1.layer1.conv1
-            model/backbone/layer1/layer1/conv1
-
-        into:
-            model.backbone.layer1.conv1
-        """
-        prefix = str(prefix).replace("/", ".")
-        parts = [p for p in prefix.split(".") if p]
-
-        collapsed = []
-        for part in parts:
-            if (
-                collapsed
-                and collapsed[-1] == part
-                and cls._SSR_DUP_LAYER_RE.match(part)
-            ):
-                continue
-            collapsed.append(part)
-
-        return ".".join(collapsed)
-
     def _normalize_prefix(self, prefix):
         prefix = super()._normalize_prefix(prefix)
         return self._collapse_ssr_duplicate_layer_segments(prefix)
+
+    def _onnx_node_name_to_module(self, node_name, op_type=None):
+        module_name = super()._onnx_node_name_to_module(node_name, op_type)
+        return self._collapse_ssr_duplicate_layer_segments(module_name)
 
     def _normalize_ssr_state_keys(self, state_dict):
         normalized = {}
@@ -432,29 +412,18 @@ class SSRExtractor(QuantizedOnnxExtractor):
     def collect_torch_state(self):
         state_dict, missing_input, missing_output = super().collect_torch_state()
 
-        missing_input = [
-            prefix
-            for prefix in missing_input
-            if not self._has_torch_qparams(state_dict, prefix, "input")
-        ]
-
-        missing_output = [
-            prefix
-            for prefix in missing_output
-            if not self._has_torch_qparams(state_dict, prefix, "output")
-        ]
-
-        return state_dict, missing_input, missing_output
-
         state_dict = self._normalize_ssr_state_keys(state_dict)
 
         missing_input = [
             self._collapse_ssr_duplicate_layer_segments(prefix)
             for prefix in missing_input
+            if not self._has_torch_qparams(state_dict, prefix, "input")
         ]
+
         missing_output = [
             self._collapse_ssr_duplicate_layer_segments(prefix)
             for prefix in missing_output
+            if not self._has_torch_qparams(state_dict, prefix, "output")
         ]
 
         return state_dict, missing_input, missing_output
@@ -462,6 +431,7 @@ class SSRExtractor(QuantizedOnnxExtractor):
     def collect_encodings(self):
         encodings, missing_input, missing_output = super().collect_encodings()
         encodings = self._fill_missing_attention_proj_inputs_in_encodings(encodings)
+        encodings = self._normalize_ssr_activation_encodings(encodings)
 
         activation_encodings = encodings.get("activation_encodings", {})
 
@@ -477,7 +447,7 @@ class SSRExtractor(QuantizedOnnxExtractor):
         ]
 
         missing_output = [
-            prefix
+            self._collapse_ssr_duplicate_layer_segments(prefix)
             for prefix in missing_output
             if not self._has_encoding_qparams(
                 activation_encodings,
