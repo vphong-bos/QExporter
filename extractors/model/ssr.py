@@ -10,10 +10,15 @@ import copy
 from ..qdq import QuantizedOnnxExtractor
 
 import re
+<<<<<<< HEAD
+=======
+
+>>>>>>> 7049b1c (hotfix: layer duplicated)
 
 class SSRExtractor(QuantizedOnnxExtractor):
     _SSR_DUP_LAYER_RE = re.compile(r"^layer\d+$", re.IGNORECASE)
 
+<<<<<<< HEAD
     @classmethod
     def _collapse_ssr_duplicate_layer_segments(cls, prefix):
         """Collapse SSR duplicate adjacent layer names.
@@ -66,6 +71,8 @@ class SSRExtractor(QuantizedOnnxExtractor):
             for alias in self._ssr_prefix_aliases(prefix)
         )
     
+=======
+>>>>>>> 7049b1c (hotfix: layer duplicated)
     def __init__(
         self,
         ckpt_path,
@@ -82,6 +89,62 @@ class SSRExtractor(QuantizedOnnxExtractor):
             "Constant", "ConstantOfShape",
             "Where", "RoiAlign", "Pad", "Slice", "Resize",
         }
+
+    @classmethod
+    def _collapse_ssr_duplicate_layer_segments(cls, prefix):
+        """Reduce names like:
+            model.backbone.layer1.layer1.conv1
+            model/backbone/layer1/layer1/conv1
+
+        into:
+            model.backbone.layer1.conv1
+        """
+        prefix = str(prefix).replace("/", ".")
+        parts = [p for p in prefix.split(".") if p]
+
+        collapsed = []
+        for part in parts:
+            if (
+                collapsed
+                and collapsed[-1] == part
+                and cls._SSR_DUP_LAYER_RE.match(part)
+            ):
+                continue
+            collapsed.append(part)
+
+        return ".".join(collapsed)
+
+    def _normalize_prefix(self, prefix):
+        prefix = super()._normalize_prefix(prefix)
+        return self._collapse_ssr_duplicate_layer_segments(prefix)
+
+    def _normalize_ssr_state_keys(self, state_dict):
+        normalized = {}
+
+        for key, value in state_dict.items():
+            new_key = self._collapse_ssr_duplicate_layer_segments(key)
+
+            # Prefer existing normalized key if both forms exist.
+            if new_key not in normalized:
+                normalized[new_key] = value
+
+        state_dict.clear()
+        state_dict.update(normalized)
+        return state_dict
+
+    def _normalize_ssr_activation_encodings(self, encodings):
+        activation_encodings = encodings.get("activation_encodings", {})
+        normalized = {}
+
+        for key, value in activation_encodings.items():
+            new_key = self._collapse_ssr_duplicate_layer_segments(key)
+
+            # Prefer existing normalized key if both forms exist.
+            if new_key not in normalized:
+                normalized[new_key] = value
+
+        encodings["activation_encodings"] = normalized
+        return encodings
 
     def _find_compute_node_from_weight_qdq(self, weight_tensor_name):
         """Override to include LayerNormalization, InstanceNormalization, and Gather as compute ops for SSR."""
@@ -375,6 +438,7 @@ class SSRExtractor(QuantizedOnnxExtractor):
 
     def collect_torch_state(self):
         state_dict, missing_input, missing_output = super().collect_torch_state()
+<<<<<<< HEAD
 
         missing_input = [
             prefix
@@ -389,16 +453,36 @@ class SSRExtractor(QuantizedOnnxExtractor):
         ]
 
         return state_dict, missing_input, missing_output
+=======
+>>>>>>> 7049b1c (hotfix: layer duplicated)
 
+        state_dict = self._normalize_ssr_state_keys(state_dict)
+
+        missing_input = [
+            self._collapse_ssr_duplicate_layer_segments(prefix)
+            for prefix in missing_input
+        ]
+        missing_output = [
+            self._collapse_ssr_duplicate_layer_segments(prefix)
+            for prefix in missing_output
+        ]
+
+        return state_dict, missing_input, missing_output
+    
     def collect_encodings(self):
         encodings, missing_input, missing_output = super().collect_encodings()
         encodings = self._fill_missing_attention_proj_inputs_in_encodings(encodings)
+<<<<<<< HEAD
 
         activation_encodings = encodings.get("activation_encodings", {})
+=======
+        encodings = self._normalize_ssr_activation_encodings(encodings)
+>>>>>>> 7049b1c (hotfix: layer duplicated)
 
         missing_input = [
-            prefix
+            self._collapse_ssr_duplicate_layer_segments(prefix)
             for prefix in missing_input
+<<<<<<< HEAD
             if not self._has_encoding_qparams(
                 activation_encodings,
                 prefix,
@@ -419,3 +503,12 @@ class SSRExtractor(QuantizedOnnxExtractor):
         ]
 
         return encodings, missing_input, missing_output
+=======
+        ]
+        missing_output = [
+            self._collapse_ssr_duplicate_layer_segments(prefix)
+            for prefix in missing_output
+        ]
+
+        return encodings, missing_input, missing_output
+>>>>>>> 7049b1c (hotfix: layer duplicated)
