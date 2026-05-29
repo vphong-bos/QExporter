@@ -10,15 +10,10 @@ import copy
 from ..qdq import QuantizedOnnxExtractor
 
 import re
-<<<<<<< HEAD
-=======
-
->>>>>>> 7049b1c (hotfix: layer duplicated)
 
 class SSRExtractor(QuantizedOnnxExtractor):
     _SSR_DUP_LAYER_RE = re.compile(r"^layer\d+$", re.IGNORECASE)
 
-<<<<<<< HEAD
     @classmethod
     def _collapse_ssr_duplicate_layer_segments(cls, prefix):
         """Collapse SSR duplicate adjacent layer names.
@@ -71,8 +66,6 @@ class SSRExtractor(QuantizedOnnxExtractor):
             for alias in self._ssr_prefix_aliases(prefix)
         )
     
-=======
->>>>>>> 7049b1c (hotfix: layer duplicated)
     def __init__(
         self,
         ckpt_path,
@@ -438,7 +431,6 @@ class SSRExtractor(QuantizedOnnxExtractor):
 
     def collect_torch_state(self):
         state_dict, missing_input, missing_output = super().collect_torch_state()
-<<<<<<< HEAD
 
         missing_input = [
             prefix
@@ -453,8 +445,6 @@ class SSRExtractor(QuantizedOnnxExtractor):
         ]
 
         return state_dict, missing_input, missing_output
-=======
->>>>>>> 7049b1c (hotfix: layer duplicated)
 
         state_dict = self._normalize_ssr_state_keys(state_dict)
 
@@ -472,17 +462,12 @@ class SSRExtractor(QuantizedOnnxExtractor):
     def collect_encodings(self):
         encodings, missing_input, missing_output = super().collect_encodings()
         encodings = self._fill_missing_attention_proj_inputs_in_encodings(encodings)
-<<<<<<< HEAD
 
         activation_encodings = encodings.get("activation_encodings", {})
-=======
-        encodings = self._normalize_ssr_activation_encodings(encodings)
->>>>>>> 7049b1c (hotfix: layer duplicated)
 
         missing_input = [
             self._collapse_ssr_duplicate_layer_segments(prefix)
             for prefix in missing_input
-<<<<<<< HEAD
             if not self._has_encoding_qparams(
                 activation_encodings,
                 prefix,
@@ -503,12 +488,3 @@ class SSRExtractor(QuantizedOnnxExtractor):
         ]
 
         return encodings, missing_input, missing_output
-=======
-        ]
-        missing_output = [
-            self._collapse_ssr_duplicate_layer_segments(prefix)
-            for prefix in missing_output
-        ]
-
-        return encodings, missing_input, missing_output
->>>>>>> 7049b1c (hotfix: layer duplicated)
