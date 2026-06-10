@@ -9,8 +9,63 @@ import copy
 
 from ..qdq import QuantizedOnnxExtractor
 
+import re
 
 class SSRExtractor(QuantizedOnnxExtractor):
+    _SSR_DUP_LAYER_RE = re.compile(r"^layer\d+$", re.IGNORECASE)
+
+    @classmethod
+    def _collapse_ssr_duplicate_layer_segments(cls, prefix):
+        """Collapse SSR duplicate adjacent layer names.
+
+        Example:
+            model.backbone.layer1.layer1.conv1
+            -> model.backbone.layer1.conv1
+
+        Only collapses adjacent layerN/layerN-style duplicates, so names like
+        layer1.block.layer1 are preserved.
+        """
+        normalized = str(prefix).replace("/", ".")
+        parts = [part for part in normalized.split(".") if part]
+
+        collapsed = []
+        for part in parts:
+            if (
+                collapsed
+                and collapsed[-1] == part
+                and cls._SSR_DUP_LAYER_RE.match(part)
+            ):
+                continue
+            collapsed.append(part)
+
+        return ".".join(collapsed)
+
+    def _ssr_prefix_aliases(self, prefix):
+        aliases = []
+
+        for candidate in (prefix, self._normalize_prefix(prefix)):
+            candidate = str(candidate).replace("/", ".")
+            collapsed = self._collapse_ssr_duplicate_layer_segments(candidate)
+
+            for alias in (candidate, collapsed):
+                if alias and alias not in aliases:
+                    aliases.append(alias)
+
+        return aliases
+
+    def _has_torch_qparams(self, state_dict, prefix, role):
+        return any(
+            f"{alias}.{role}_scale" in state_dict
+            and f"{alias}.{role}_zero_point" in state_dict
+            for alias in self._ssr_prefix_aliases(prefix)
+        )
+
+    def _has_encoding_qparams(self, activation_encodings, prefix, role, index="0"):
+        return any(
+            index in activation_encodings.get(alias, {}).get(role, {})
+            for alias in self._ssr_prefix_aliases(prefix)
+        )
+    
     def __init__(
         self,
         ckpt_path,
@@ -27,6 +82,42 @@ class SSRExtractor(QuantizedOnnxExtractor):
             "Constant", "ConstantOfShape",
             "Where", "RoiAlign", "Pad", "Slice", "Resize",
         }
+
+    def _normalize_prefix(self, prefix):
+        prefix = super()._normalize_prefix(prefix)
+        return self._collapse_ssr_duplicate_layer_segments(prefix)
+
+    def _onnx_node_name_to_module(self, node_name, op_type=None):
+        module_name = super()._onnx_node_name_to_module(node_name, op_type)
+        return self._collapse_ssr_duplicate_layer_segments(module_name)
+
+    def _normalize_ssr_state_keys(self, state_dict):
+        normalized = {}
+
+        for key, value in state_dict.items():
+            new_key = self._collapse_ssr_duplicate_layer_segments(key)
+
+            # Prefer existing normalized key if both forms exist.
+            if new_key not in normalized:
+                normalized[new_key] = value
+
+        state_dict.clear()
+        state_dict.update(normalized)
+        return state_dict
+
+    def _normalize_ssr_activation_encodings(self, encodings):
+        activation_encodings = encodings.get("activation_encodings", {})
+        normalized = {}
+
+        for key, value in activation_encodings.items():
+            new_key = self._collapse_ssr_duplicate_layer_segments(key)
+
+            # Prefer existing normalized key if both forms exist.
+            if new_key not in normalized:
+                normalized[new_key] = value
+
+        encodings["activation_encodings"] = normalized
+        return encodings
 
     def _find_compute_node_from_weight_qdq(self, weight_tensor_name):
         """Override to include LayerNormalization, InstanceNormalization, and Gather as compute ops for SSR."""
@@ -320,21 +411,50 @@ class SSRExtractor(QuantizedOnnxExtractor):
 
     def collect_torch_state(self):
         state_dict, missing_input, missing_output = super().collect_torch_state()
-        missing_input = [
-            prefix
-            for prefix in missing_input
-            if f"{prefix}.input_scale" not in state_dict
-            or f"{prefix}.input_zero_point" not in state_dict
-        ]
-        return state_dict, missing_input, missing_output
 
+        state_dict = self._normalize_ssr_state_keys(state_dict)
+
+        missing_input = [
+            self._collapse_ssr_duplicate_layer_segments(prefix)
+            for prefix in missing_input
+            if not self._has_torch_qparams(state_dict, prefix, "input")
+        ]
+
+        missing_output = [
+            self._collapse_ssr_duplicate_layer_segments(prefix)
+            for prefix in missing_output
+            if not self._has_torch_qparams(state_dict, prefix, "output")
+        ]
+
+        return state_dict, missing_input, missing_output
+    
     def collect_encodings(self):
         encodings, missing_input, missing_output = super().collect_encodings()
         encodings = self._fill_missing_attention_proj_inputs_in_encodings(encodings)
+        encodings = self._normalize_ssr_activation_encodings(encodings)
+
         activation_encodings = encodings.get("activation_encodings", {})
+
         missing_input = [
-            prefix
+            self._collapse_ssr_duplicate_layer_segments(prefix)
             for prefix in missing_input
-            if "0" not in activation_encodings.get(self._normalize_prefix(prefix), {}).get("input", {})
+            if not self._has_encoding_qparams(
+                activation_encodings,
+                prefix,
+                "input",
+                "0",
+            )
         ]
+
+        missing_output = [
+            self._collapse_ssr_duplicate_layer_segments(prefix)
+            for prefix in missing_output
+            if not self._has_encoding_qparams(
+                activation_encodings,
+                prefix,
+                "output",
+                "0",
+            )
+        ]
+
         return encodings, missing_input, missing_output

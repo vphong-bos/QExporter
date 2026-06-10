@@ -3,6 +3,7 @@ int8_model
 qparams/vit.pt
 qparams/vit_int8_extracted.pt
 ssr_qparams.pt
+qparams
 
 __pycache__/
 *.pyc
